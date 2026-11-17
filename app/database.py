@@ -47,6 +47,65 @@ CREATE TABLE IF NOT EXISTS revisions (
 
 CREATE INDEX IF NOT EXISTS idx_revisions_parent
     ON revisions(parent_product_id, parent_revision);
+
+-- ---------------------------------------------------------------------------
+-- 异地备份盘点（对账）
+-- ---------------------------------------------------------------------------
+
+-- 盘点单：开单时固定预定页数；封单后状态与报告不可再变
+CREATE TABLE IF NOT EXISTS inventory_orders (
+    order_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    status          TEXT NOT NULL CHECK (status IN ('open', 'sealed')),
+    expected_pages  INTEGER NOT NULL CHECK (expected_pages >= 1),
+    snapshot_size   INTEGER NOT NULL DEFAULT 0,
+    note            TEXT,
+    created_at      TEXT NOT NULL,
+    sealed_at       TEXT
+);
+
+-- 开单瞬间的本地现役目录快照（之后的入库不影响本次对账）
+CREATE TABLE IF NOT EXISTS inventory_snapshots (
+    order_id    INTEGER NOT NULL REFERENCES inventory_orders(order_id),
+    product_id  TEXT NOT NULL,
+    revision    INTEGER NOT NULL,
+    summary     TEXT NOT NULL,
+    PRIMARY KEY (order_id, product_id)
+);
+
+-- 已接收的目录页；content_hash 用于识别“同页同内容重试”
+CREATE TABLE IF NOT EXISTS inventory_pages (
+    order_id     INTEGER NOT NULL REFERENCES inventory_orders(order_id),
+    page_no      INTEGER NOT NULL,
+    item_count   INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    received_at  TEXT NOT NULL,
+    PRIMARY KEY (order_id, page_no)
+);
+
+-- 页内条目：每个成果号在整单中只允许出现一次（跨页同号即冲突）
+CREATE TABLE IF NOT EXISTS inventory_page_items (
+    order_id   INTEGER NOT NULL,
+    page_no    INTEGER NOT NULL,
+    product_id TEXT NOT NULL,
+    revision   INTEGER NOT NULL,
+    summary    TEXT NOT NULL,
+    PRIMARY KEY (order_id, page_no, product_id),
+    FOREIGN KEY (order_id, page_no)
+        REFERENCES inventory_pages(order_id, page_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_inventory_items_order_product
+    ON inventory_page_items(order_id, product_id);
+
+-- 封单报告：与 orders.status='sealed' 在同一事务内原子写入，此后只读
+CREATE TABLE IF NOT EXISTS inventory_reports (
+    order_id          INTEGER PRIMARY KEY REFERENCES inventory_orders(order_id),
+    missing_json      TEXT NOT NULL,
+    mismatched_json   TEXT NOT NULL,
+    extra_json        TEXT NOT NULL,
+    backup_item_count INTEGER NOT NULL,
+    created_at        TEXT NOT NULL
+);
 """
 
 

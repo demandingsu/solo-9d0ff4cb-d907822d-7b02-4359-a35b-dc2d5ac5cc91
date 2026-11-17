@@ -14,12 +14,18 @@ from typing import Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 
 from . import database as db
+from . import inventory
 from . import lineage
 from .schemas import (
     BatchRecord,
     BatchResponse,
     BatchSubmission,
     HealthResponse,
+    InventoryOrderCreate,
+    InventoryOrderRecord,
+    InventoryPageResponse,
+    InventoryPageSubmission,
+    InventoryReport,
     ProductStatus,
     RevisionHistoryItem,
     RevisionHistoryResponse,
@@ -62,9 +68,11 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         title="影像谱系 API",
         description=(
             "分批提交原始瓦片与拼图清单，追踪多级固定父引用，"
-            "查询现役拼图的可交付状态及受阻引用路径（父项缺失 / 父项已非现役 / 循环引用）。"
+            "查询现役拼图的可交付状态及受阻引用路径（父项缺失 / 父项已非现役 / 循环引用）；"
+            "并支持异地备份盘点：开单固定本地现役目录快照与预定页数，逐页接收异地目录，"
+            "页数齐全后封单，按开单时的现役修订给出缺失、修订/摘要不符与备份多出的对账报告。"
         ),
-        version="1.0.0",
+        version="1.1.0",
         lifespan=lifespan,
     )
 
@@ -206,6 +214,105 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         return RevisionHistoryResponse(
             product_id=product_id, active_revision=active_rev, revisions=items
         )
+
+    # ---------------- 异地备份盘点 ----------------
+    def _inventory_error(exc: inventory.InventoryError) -> HTTPException:
+        return HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+    @app.post(
+        "/api/inventory/orders",
+        response_model=InventoryOrderRecord,
+        status_code=201,
+        tags=["备份盘点"],
+        summary="开盘点单：固定本地现役目录快照与预定页数",
+    )
+    def create_inventory_order(
+        payload: InventoryOrderCreate,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> InventoryOrderRecord:
+        # 建单与快照在同一写事务内完成；开单后新入库的修订不影响本次对账
+        result = inventory.create_order(conn, payload.expected_pages, payload.note)
+        return InventoryOrderRecord(**result)
+
+    @app.get(
+        "/api/inventory/orders",
+        response_model=list[InventoryOrderRecord],
+        tags=["备份盘点"],
+        summary="列出全部盘点单及分页进度",
+    )
+    def list_inventory_orders(
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> list[InventoryOrderRecord]:
+        with db.snapshot(conn):
+            records = [inventory.order_record(conn, r)
+                       for r in inventory.list_orders(conn)]
+        return [InventoryOrderRecord(**rec) for rec in records]
+
+    @app.get(
+        "/api/inventory/orders/{order_id}",
+        response_model=InventoryOrderRecord,
+        tags=["备份盘点"],
+        summary="查询单个盘点单的分页进度（不含对账结论）",
+    )
+    def get_inventory_order(
+        order_id: int, conn: sqlite3.Connection = Depends(get_conn)
+    ) -> InventoryOrderRecord:
+        with db.snapshot(conn):
+            row = inventory.get_order(conn, order_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"盘点单 {order_id} 不存在")
+            record = inventory.order_record(conn, row)
+        return InventoryOrderRecord(**record)
+
+    @app.post(
+        "/api/inventory/orders/{order_id}/pages",
+        response_model=InventoryPageResponse,
+        status_code=201,
+        tags=["备份盘点"],
+        summary="上传一页异地目录（同页同内容重试幂等；换内容/跨页同号拒绝）",
+    )
+    def upload_inventory_page(
+        order_id: int,
+        payload: InventoryPageSubmission,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> InventoryPageResponse:
+        items = [item.model_dump() for item in payload.items]
+        try:
+            result = inventory.submit_page(conn, order_id, payload.page_no, items)
+        except inventory.InventoryError as exc:
+            raise _inventory_error(exc) from exc
+        return InventoryPageResponse(**result)
+
+    @app.post(
+        "/api/inventory/orders/{order_id}/seal",
+        response_model=InventoryReport,
+        tags=["备份盘点"],
+        summary="页数齐全后封单，原子生成对账报告（重复封单幂等）",
+    )
+    def seal_inventory_order(
+        order_id: int, conn: sqlite3.Connection = Depends(get_conn)
+    ) -> InventoryReport:
+        try:
+            report = inventory.seal_order(conn, order_id)
+        except inventory.InventoryError as exc:
+            raise _inventory_error(exc) from exc
+        return InventoryReport(**report)
+
+    @app.get(
+        "/api/inventory/orders/{order_id}/report",
+        response_model=InventoryReport,
+        tags=["备份盘点"],
+        summary="获取已定稿的对账报告（未封单一律 409）",
+    )
+    def get_inventory_report(
+        order_id: int, conn: sqlite3.Connection = Depends(get_conn)
+    ) -> InventoryReport:
+        with db.snapshot(conn):
+            try:
+                report = inventory.get_report(conn, order_id)
+            except inventory.InventoryError as exc:
+                raise _inventory_error(exc) from exc
+        return InventoryReport(**report)
 
     return app
 
